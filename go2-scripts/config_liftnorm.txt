@@ -1,0 +1,4 @@
+reference;/lustre/groups/itg/shared/referenceData/reference_sequences/UCSC_hg19/hg19.fa
+SourceBuild;ChainFile
+_38_;/lustre/groups/itg/shared/referenceData/chain_files/hg38ToHg19.over.chain.gz
+_19_;/lustre/groups/itg/shared/referenceData/chain_files/hg19ToHg38.over.chain.gz     

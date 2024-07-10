@@ -1,0 +1,499 @@
+#!/bin/bash
+
+######################################################################################################
+# Help
+######################################################################################################
+Help()
+{
+   # Display Help
+    echo "usage: ./runliftnorm [-h] [-f <inputfile>] [-C <configfile>] [-O <outputdir>]
+                [-r <refgenome>][-c <chainfile>] [-t <targetbuild>] [-w] [-n] [-T] [-D]"
+    echo
+    echo "Converts genome coordinates between different reference assemblies for VCF format files
+        (e.g.from human hg38 to hg19) using CrossMap utility."
+    printf "Chromosomes Coordinates & Reference Alleles are updated to a new assembly,
+            and all the other fields are not changed\n"
+    echo "Left-aligns and normalizes indels, checks if REF alleles match the reference using bcftools utility"
+    echo
+    echo
+    echo "required arguments:"
+    echo "-f,  --inputfile      file name (REQUIRED)"
+    echo "-C,  --configfile     plain text file with location of chromosome sequences of target assembly and
+                        location of chainfiles for liftover process; default: 'config_liftnorm.txt' (REQUIRED)"
+    echo "-O,  --outputdir      output directory normalized files (default ./liftnorm)"
+    echo
+    echo "optional arguments:"
+    echo "-h,  --help           show  this help message and exit"
+    echo "-t,  --targetbuild    character code for target build (default: _37_)"
+    echo "-r,  --refgenome      chromosome sequences of target assembly in FASTA (default: in configfile):
+                                (https://en.wikipedia.org/wiki/FASTA_format)"
+    echo "-c,  --chainfile      chain file describes pairwise alignments between two genomes(default: in configfile):
+                                (https://genome.ucsc.edu/goldenPath/help/chain.html)"
+    echo "-w,  --overwrite        when enabled, overwrite existing files."
+    echo "-n,  --do-not-sort     Assume summary stats are sorted, do not re-sort by chromosome and position."
+    echo "-u,  --useheader        do not use list2 of expected headers"
+    echo "-D, --no-discard-id-alleles Don't discard positions where REF and ALT are the same after liftover.
+            Disabled by default since normalisation is performed."
+    echo "-s,  --set-ref-allele set or fix reference allele from reference genome"
+    echo "-l,  --left-align, left-align and normalize indels"
+    echo "-d   --no-diagnostic-file, do not generate a diagnostic file to document allele changes"
+    echo "-R,  --remove-intermediate-files     when enabled, delete intermediate files"    
+    echo
+}
+
+#####################################################################################################################################################################################################################
+# Script path
+#####################################################################################################################################################################################################################
+BUNDLE="lib"
+SCRIPTPATH="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+######################################################################################################################################################################################################################
+# Main program
+######################################################################################################################################################################################################################
+######################################################################################################################################################################################################################
+# Process input options
+######################################################################################################################################################################################################################
+# set switches/tags default values
+compalleles=""
+nosortfile=""
+useheader=""
+overwrite=""
+setrefallele=""
+leftalign=""
+diagnosticfile=""
+removefiles=""
+#######################################################################################################################################################################################################################
+# $# total number of passed arguments the $1 $2 ...
+PARSED_ARGUMENTS=$(getopt -a -n runliftnorm -o hf:r:c:t:C:O:wnuksldR --long help,inputfile:,refgenome:,chainfile:,targetbuild:,configfile:,outputdir:,overwrite,do-not-sort,useheader,no-comp-alleles,set-ref-allele,left-align,diagnostic-file,remove-intermediate-files -- "$@")
+VALID_ARGUMENTS=$?
+if [ "$VALID_ARGUMENTS" != "0" ]; then
+  Help
+  exit 2
+fi
+#echo "VALID_ARG is : $VALID_ARGUMENTS"
+echo "PARSED_ARGUMENTS : $PARSED_ARGUMENTS"
+eval set -- "$PARSED_ARGUMENTS"
+while :
+do
+  case "$1" in
+    -w | --overwrite)   overwrite=1;   shift   ;;
+    -n | --do-not-sort) nosortfile=1;  shift   ;;
+    -u | --nheader)      nheader=1;     shift  ;;
+    -d | --no-diagnostic-file) diagnosticfile=1; shift ;;
+    -D | --no-discard-id-alleles) nodiscardvariants=1 ; shift ;;
+    -R | --remove-intermediate-files) removefiles=1; shift;;
+    -s | --set-ref-allele) setrefallele=1; shift ;;
+    -l | --left-align)  leftalign=1;       shift  ;;
+    -f | --inputfile) inputfile="$2" ; shift 2 ;;
+    -r | --refgenome)   refgenome="$2"   ; shift 2 ;;
+    -c | --chainfile)   chainfile="$2"   ; shift 2 ;;
+    -t | --targetbuild)   targetbuild="$2"   ; shift 2 ;;
+    -C | --configfile)   configfile="$2"   ; shift 2 ;;
+    -O | --outputdir)   outputdir="$2"   ; shift 2 ;;
+    -h | --help)
+    Help
+    exit   ;;
+    --) shift; break ;;
+    *) echo "Error: Invalid option: $1"
+       Help
+       exit ;;
+  esac
+done
+
+#---------------------------
+###  Verify Input Options
+#==========================
+## script path
+if [[ -d ${SCRIPTPATH}/${BUNDLE} ]]; then
+    echo "Running from: $SCRIPTPATH"
+else
+    echo "A directory named lib was not found where this script is located. Please clone the Github repository again."
+fi
+
+echo Running on $(hostname)
+date
+
+## input file
+if [[ -z "$inputfile" ]]; then
+  echo
+  echo ERROR:
+  echo "Required argument input file is missing."
+  echo
+  Help
+  exit
+fi
+
+
+if [[ -s ${inputfile} ]]; then
+  echo "Summary statistics file is: $inputfile"
+  # Get filename without suffix
+  filename=$(basename ${inputfile} .gz)
+  sourcebuild=$(echo ${inputfile} | grep -Eo '_[0-9]{2}_')
+  echo "Source build inputfile is: ${sourcebuild}"
+else
+  echo
+  echo ERROR:
+  echo "input file $inputfile is empty."
+  exit 1
+fi
+
+# Assert: at this point, a sumstats file is defined and its source build is known
+
+## target build
+if [[ -z ${targetbuild} ]]; then
+    targetbuild="_37_"
+    echo "Target build is: ${targetbuild}"
+else
+    echo "Target build is: ${targetbuild}"
+fi
+
+# Assert: at this point, a target build is defined
+
+## config file
+if [[ -n ${configfile} ]] && [[ -f ${configfile} ]]; then
+  echo "Configuration file is: $configfile"
+elif [ -s "$SCRIPTPATH/config_liftnorm.txt" ]; then
+  echo INFO: No config file provided. Using default $SCRIPTPATH/config_liftnorm.txt.
+  configfile=$SCRIPTPATH/config_liftnorm.txt
+else
+  echo
+  echo ERROR:
+  echo "Required argument config file is missing and none is present in the script dir."
+  echo
+fi
+
+# Assert: at this point, a config file is defined
+
+## reference genome FASTA
+if [[ -z ${refgenome} ]]; then
+  # Get target refgenome
+  refgenome=$(grep '^reference' ${configfile} | cut -d ";" -f2)
+  if [[ -z "$refgenome" ]]; then
+    echo ERROR: No reference genome provided and no reference is provided in config file $configfile.
+    exit 1
+  fi
+  if [[ ! -s "$refgenome" ]]; then
+    echo -e ERROR: Reference genome provided doesn\'t exist or is empty : $refgenome
+    exit 1
+  fi
+fi
+
+# Assert: at this point, a reference file is provided
+
+
+## chainfile
+if [[ ! $inputfile =~ ${targetbuild} ]]; then
+    chainfile=$(grep ${sourcebuild} ${configfile} | cut -d ";" -f2)
+    if [[ -z "$chainfile" ]]; then
+      echo ERROR: Liftover is required but no chain file is provided in the configuration file $configfile.
+      exit 1
+    fi
+fi
+
+## output dir
+if [[ -z "${outputdir}" ]]; then
+    outputdir="$(pwd)/liftnorm"
+    echo "Output directory not given, defaulting to $outputdir"
+else
+  echo "Output directory is: $outputdir"
+fi
+
+mkdir -p ${outputdir}
+abs_outdir=$(readlink -f $outputdir)
+
+## intermediate files
+if [[ -n $removefiles ]]; then
+  echo "Delete intermediate files"
+else 
+   echo "Keep intermediate files"
+fi
+
+#---------------------------------------------------------
+### 1. Generate VCF from summary stats file
+#=========================================================
+printf "\n=======      Generate VCF with createVCF      =======\n"
+overwrite_arg=$([ -z "$overwrite" ] && echo "" || echo "-w")
+nosortfile_arg=$([ -z "$nosortfile" ] && echo "" || echo -e "\055n")  # necessary because echo -n is an echo option
+useheader_arg=""
+echo Running ${SCRIPTPATH}/${BUNDLE}/createVCF.py $inputfile -o $outputdir $overwrite_arg $nosortfile_arg $useheader_arg
+${SCRIPTPATH}/${BUNDLE}/createVCF.py $inputfile -o $outputdir $overwrite_arg $nosortfile_arg $useheader_arg
+retVal=$?
+if [[ $retVal -ne 0 ]];then
+  echo "Error: createVCF.py exited abnormally."
+  exit 1
+fi
+
+duplicate_ids_vcf="${abs_outdir}/${filename}.duplicates.vcf.gz"
+
+#-------------------------------------------------------
+### 2. Liftover
+#=======================================================
+inputfile2="${abs_outdir}/${filename}.vcf.gz" # VCF output file name
+if [[ ! -s $inputfile2 ]]; then
+  echo "Error: Expected output file $inputfile2 is missing. createVCF.py probably failed."
+  exit 1
+fi
+inputfile3=$inputfile2
+
+if [[ ! $inputfile2 =~ ${targetbuild} ]]; then
+    printf "\n=======         LiftOver with CrossMap          =======\n"
+    echo "=======             $sourcebuild to $targetbuild              ======="
+    discardvariant_arg=$([ -z $nodiscardvariants ] && echo "-k" || echo "")
+    echo Running ${SCRIPTPATH}/${BUNDLE}/liftover.sh -c $chainfile -f $inputfile2 -r $refgenome -d $outputdir $discardvariant_arg
+    ${SCRIPTPATH}/${BUNDLE}/liftover.sh -c $chainfile -f $inputfile2 -r $refgenome -d $outputdir $discardvariant_arg
+    inputfile3="${abs_outdir}/lift_out_${filename}.vcf.gz"
+    unmapped_vcf="${abs_outdir}/lift_out_${filename}.vcf.unmap"
+    #num_lines=$(zcat $inputfile3 | wc -l)
+    #bcftools view -e 'REF==ALT' $inputfile3 | bgzip | sponge $inputfile3
+    #echo Removed $(( $num_lines - $(zcat $inputfile3 | wc -l) )) lines with nonsensical ALTs after liftover.
+
+    ## The above 3 work but it is more efficient to do it in the R script which avoids rereading
+    ## the sumstats 3 times!
+
+
+    # Exclude variants with #CHROM like `chr11_gl000202_random` or `chrUn_gl000226`
+    # See: https://genome-euro.ucsc.edu/cgi-bin/hgGateway?redirect=manual&source=genome.ucsc.edu
+    lines_before=$(zgrep -v "#" $inputfile3 | wc -l)
+
+    invalid_chrom_vcf="${abs_outdir}/lift_out_${filename}.invalid_chrom.vcf.gz"
+    zcat $inputfile3 | 
+      awk '{
+        abnormal_chrom=$1 ~ /_/
+        comment=$0 ~ /^#/
+        if (abnormal_chrom || comment) {print $0}}' | 
+      bgzip > $invalid_chrom_vcf
+
+    zcat $inputfile3 | 
+      awk '{
+        normal_chrom=$1 ~ /^chr[0-9X]+/
+        abnormal_chrom=$1 ~ /_/
+        comment=$0 ~ /^#/
+        if ((normal_chrom && !abnormal_chrom) || comment) {print $0}}' |
+      bgzip | sponge $inputfile3
+
+    lines_after=$(zgrep -v "#" $inputfile3 | wc -l)
+    excluded_variant_count=$(( lines_before - lines_after ))
+
+    echo "$excluded_variant_count variants with abnormal chromosome values excluded."
+    echo "See $invalid_chrom_vcf to check what variants were excluded."
+
+
+    inputfile4="${abs_outdir}/lift_out_${filename}.fixed.vcf.gz"
+    liftover_excluded="${abs_outdir}/lift_out_${filename}.excluded.vcf.gz"
+    ${SCRIPTPATH}/${BUNDLE}/fix_liftover.R \
+      --before-vcf $inputfile2 \
+      --after-vcf $inputfile3 \
+      --output-vcf $inputfile4 \
+      --excluded-vcf $liftover_excluded
+
+    inputfile3="$inputfile4"
+
+    if [[ ! -s "$inputfile3" ]]; then
+      echo "Error: expected output file $inputfile3 missing or empty. Liftover probably failed."
+      exit 1
+    fi
+fi
+
+#-------------------------------------------------------
+### 3. Removal of <DEL>s
+#=======================================================
+#zcat $inputfile3| awk '{a=$4~/[^ACGT]/;b=$5~/[^ACGT]/;c=$0~/^#/;if(c || (a && !b) || (b && !a)){print $0};if(b && a){ct=ct+1;}}END{if(ct>0){print ct" lines removed because of unsolvable alleles" >> "/dev/stderr"}}' | bgzip > $ifile_del
+#isDel=$(zcat $ifile_del | head -1 | wc -l) # since ifile_del is gzipped we cannot easily test emptiness
+# the above 2 lines, when uncommented, add CNV alleles to the del file
+# these are unresolvable without the original VCF info fields, which we do not have (only sumstats)
+## the original code block is in commit d37bec9a5d599e320bcf825b5fc4aae2dfdab2d4
+## Since we now have the possibility of non-analysable alleles, we filter straight away.
+
+ifile_nodel=${inputfile3/.vcf.gz/.nodel.vcf.gz}
+num_lines=$({ zcat $inputfile3 |
+              awk '{
+                a=$4~/[^ACGT]/
+                b=$5~/[^ACGT]/
+                c=$0~/^#/
+                if (c || (!a && !b)){print $0}}
+                END{print NR >> "/dev/stderr"}' |
+              bgzip > $ifile_nodel; } 2>&1)
+
+excluded_non_atgc=${inputfile3/.vcf.gz/.non-atgc.vcf.gz}
+zcat $inputfile3 |
+  awk '{
+    a=$4~/[^ACGT]/
+    b=$5~/[^ACGT]/
+    c=$0~/^#/
+    if (c || a || b){print $0}}' |
+  bgzip > $excluded_non_atgc
+
+# ifile_del=${inputfile3/.vcf.gz/.del.vcf.gz}
+# isDel=$(zgrep -m1 -F '<DEL>' $inputfile3| wc -l)
+# if [[ isDel -gt 0 ]]; then
+#   # we have DELs in our file. They need to be separated, then merged with the clean file above
+#   printf "\n=======           Fix <DEL>s         =======\n"
+#   echo "Info: DEL alleles detected in the input. Splitting, fixing and merging... this will take time."
+#   ifile_del=${inputfile3/.vcf.gz/.del.vcf.gz}
+#   zgrep -e '^#' -e '<DEL>' $inputfile3 | bgzip > $ifile_del
+#   echo "Fixing DELs."
+#   ifile_fixdel=${ifile_del/.vcf.gz/.fixed.vcf.gz}
+#   $SCRIPTPATH/lib/fixdel.py $ifile_del | bgzip > $ifile_fixdel
+#   if [ ! -s $ifile_fixdel ]; then
+#     echo "Error: File $ifile_fixdel failed to generate. Unable to fix DELs."
+#     exit 1
+#   fi
+#   tabix -f -p vcf $ifile_fixdel
+#   tabix -f -p vcf $ifile_nodel
+#   echo "Concatenating... will take time."
+#   ioutfile=${inputfile3/.vcf.gz/.fixdel.vcf.gz}
+#   bcftools concat -Oz -a -o $ioutfile $ifile_nodel $ifile_fixdel
+#   echo "Done."
+#   inputfile3=$ioutfile
+
+#   if [[ ! -s "$inputfile3" ]]; then
+#     echo "Error: expected output file $inputfile3 missing or empty. Concat and sort probably failed."
+#     exit 1
+#   fi
+# else
+#   # if we do not have any DEL, we carry on with the unindexed clean file with ACGT alleles
+#   echo "Info: No DEL alleles found. Skipping DEL processing."
+#   inputfile3=$ifile_nodel
+# fi
+
+inputfile3=$ifile_nodel
+## in all cases, we inform about the neither ACGT nor <DEL> alleles we have removed.
+echo $(( $num_lines - $(zcat $inputfile3 | wc -l) )) lines contained unparseable alleles and were removed.
+
+#--------------------------------------------------------------------------------------------
+### 4.  Set/Fix REF (bcftools norm step1)
+#=============================================================================================
+printf "\n=======   Set/Fix REF alllele (bcftools norm step1)    =======\n"
+# -s for setref
+echo Running ${SCRIPTPATH}/${BUNDLE}/normalize.sh -f $inputfile3 -r $refgenome -d $outputdir -s
+echo
+${SCRIPTPATH}/${BUNDLE}/normalize.sh -f $inputfile3 -r $refgenome -d $outputdir -s
+exitVal=$?
+if [[ $exitVal -ne 0 ]];then
+  echo "Error: normalize.sh exited abnormally."
+  exit 1
+fi
+# check for expected output
+expected_outsetref=${inputfile3/.vcf.gz/.setref.vcf.gz}
+if [[ ! -s $expected_outsetref ]]; then
+  echo "Error: expected output file $expected_outsetref missing or empty. Set REF probably failed."
+  exit 1
+fi
+
+#===============================================================================================
+## 5. Check REF allele Flip and Generate VCF
+#===============================================================================================
+# get tab file of inputfile3
+# printf "\n==========      Check REF allele Flip and Generate VCF  ============\n"
+# tabfile_preflip=$abs_outdir/tab_preflip_${filename}.gz
+# zcat $inputfile3 | zgrep -v '^#' | gzip -f > $tabfile_preflip
+#
+# ## a) Run checkflip.r
+# printf "\n*****     (a) Check REF Flip       *****\n"
+#Inputs:
+#tab_preflip_filename.gz #from inputfile3
+#tab_setref_filename.setref.gzq
+echo Running ${SCRIPTPATH}/${BUNDLE}/checkflip.R -p $inputfile3 -r $expected_outsetref -o $outputdir
+echo
+${SCRIPTPATH}/${BUNDLE}/checkflip.R -p $inputfile3 -r $expected_outsetref -o $outputdir
+exitVal=$?
+if [[ $exitVal -ne 0 ]];then
+  echo "Error: checkflip.r exited abnormally."
+  exit 1
+fi
+expected_outflipcheck=${inputfile3/.vcf.gz/.flipchecked.vcf.gz}
+if [[ ! -s $expected_outflipcheck ]]; then
+  echo "Error: expected output file $expected_outflipcheck missing or empty. set REF probably failed."
+  exit 1
+fi
+
+
+#--------------------------------------------------------------------------------------------
+### 6.  Normalization (bcftools norm step2)
+#=============================================================================================
+printf "\n=======    Normalization     =======\n"
+# -l for left-align
+echo Running ${SCRIPTPATH}/${BUNDLE}/normalize.sh -f $expected_outflipcheck -r $refgenome -d $outputdir -l
+${SCRIPTPATH}/${BUNDLE}/normalize.sh -f $expected_outflipcheck -r $refgenome -d $outputdir -l
+exitVal=$?
+if [[ $exitVal -ne 0 ]]; then
+  echo "Error: normalize.sh exited abnormally."
+  exit 1
+fi
+# Expected output
+expected_outnorm=${expected_outflipcheck/.vcf.gz/.leftaligned.vcf.gz}
+if [[ ! -s $expected_outnorm ]]; then
+  echo "Error: expected output file $expected_outnorm missing or empty. set REF probably failed."
+  exit 1
+fi
+
+
+#------------------------------------------------------------------------------------------------------
+### 7. Merge Sumstats data to Normalized data
+# Merge sumstats file from EasyQC with normalized output & fix allele 
+#=====================================================================================================
+printf "\n=======   Merge summary stats data from EasyQC with normalized data   =======\n"
+#Inputs
+# $inputfile -> sumStats
+# $expected_outnorm -> normDat
+diagnosticfile_arg=$([ -z "$diagnosticfile" ] && echo "" || echo "-d")
+unmapped_arg=$([ -z "${unmapped_vcf+x}" ] && echo "" || echo "--unmapped-file $unmapped_vcf")
+non_atgc_arg=$([ -z "${excluded_non_atgc+x}" ] && echo "" || echo "--non-atgc-file $excluded_non_atgc")
+invalid_chrom_arg=$([ -f "${invalid_chrom_vcf}" ] && echo "--invalid-chrom-file $invalid_chrom_vcf" || echo "")
+duplicate_ids_arg=$([ -f "$duplicate_ids_vcf" ] && echo "--duplicate-ids $duplicate_ids_vcf" || echo "")
+liftover_excluded_arg=$([ -f "$liftover_excluded" ] && echo "--liftover-excluded $liftover_excluded" || echo "")
+
+echo Running ${SCRIPTPATH}/${BUNDLE}/fixallele.R \
+      -s $inputfile \
+      -n $expected_outnorm \
+      -o $outputdir \
+      $diagnosticfile_arg \
+      $unmapped_arg \
+      $non_atgc_arg \
+      $invalid_chrom_arg \
+      $duplicate_ids_arg \
+      $liftover_excluded_arg
+
+${SCRIPTPATH}/${BUNDLE}/fixallele.R \
+      -s $inputfile \
+      -n $expected_outnorm \
+      -o $outputdir \
+      $diagnosticfile_arg \
+      $unmapped_arg \
+      $non_atgc_arg \
+      $invalid_chrom_arg \
+      $duplicate_ids_arg
+
+exitVal=$?
+if [[ $exitVal -ne 0 ]]; then
+  echo "Error: fixallele.R exited abnormally."
+  exit 1
+fi
+#Check expected output
+expected_outnormfinal=$abs_outdir/${filename}.norm.txt.gz
+if [[ ! -s $expected_outnormfinal ]]; then
+  echo "Error: expected output file $expected_outnormfinal missing or empty. merging sumstats to normalized data probably failed."
+  exit 1
+fi
+
+#--------------------------------------------------------------------------------------------
+### 8.  Delete / Keep intermediate files
+#=============================================================================================
+if [[ -n $removefiles ]]; then
+  rm ${abs_outdir}/*flipchecked*.vcf.gz
+  rm ${abs_outdir}/*excluded.vcf.gz
+  rm ${abs_outdir}/*setref*.vcf.gz 
+  rm ${abs_outdir}/*nodel*.vcf.gz
+  rm ${abs_outdir}/*${filename}.vcf.gz
+  rm -f $unmapped_vcf $excluded_non_atgc $invalid_chrom_vcf
+fi 
+
+echo
+echo "Finished Processing File `date`"
+#######################################################################################################
+## Example Call
+# defaults
+# ./runliftnorm -f inputfile.vcf.gz -C config_liftnorm.txt -O outdir -w logfile.log 2>&1&
+
+# Delete intermediate files (-R) & do not generate diagnostic file
+#./runliftnorm -f inputfile.vcf.gz -C config_liftnorm.txt -O outdir -w -d -R logfile.log 2>&1&
+#########################################################################################################

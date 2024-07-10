@@ -1,0 +1,464 @@
+import os
+import itertools
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+container: 'worker_3.2.3'
+
+metal = config['metal']
+BFILE = config['bfile']
+
+INPUT_PHENOTYPES_DF = pd.read_csv(config['input_phenotypes'], header=None)
+
+
+def bfile(ethnicity, chrom):
+    return multiext(BFILE.format(chrom=chrom), '.bed', '.bim', '.fam')
+
+def bfile_params(ethnicity, chrom):
+    return BFILE.format(chrom=chrom)
+
+rule split_sumstats:
+    input:
+        metal
+    params:
+        output=lambda w: '{output}/{ethnicity}/{phenotype}/split-sumstats/chr{chrom}.tsv'
+    output:
+        expand('{output}/{ethnicity}/{phenotype}/split-sumstats/chr{chrom}.tsv', chrom=range(1,23), allow_missing=True)
+    run:
+        sumstats = pd.read_csv(input[0], sep = '\t')
+        for chrom in set(sumstats['CHR']):
+            subset = sumstats[sumstats['CHR']==chrom]
+            outfile = params.output.format(output=wildcards.output, ethnicity=wildcards.ethnicity, phenotype=wildcards.phenotype, chrom=chrom)
+            subset.to_csv(outfile, sep = '\t', index = False)
+
+rule clump:
+    input:
+        sumstats='{output}/{ethnicity}/{phenotype}/split-sumstats/chr{chrom}.tsv',
+        bfile=lambda w: bfile(w.ethnicity, w.chrom) # multiext(bfile, '.bed', '.bim', '.fam')
+    params:
+        input_bfile=lambda w: bfile_params(w.ethnicity, w.chrom),
+        output='{output}/{ethnicity}/{phenotype}/clumps/chr{chrom}'
+    threads:
+        workflow.cores
+    output:
+        '{output}/{ethnicity}/{phenotype}/clumps/chr{chrom}.clumped'
+    log:
+        '{output}/{ethnicity}/{phenotype}/clumps/chr{chrom}.log'
+    shell: '''
+        plink \
+          --bfile {params.input_bfile} \
+          --clump-field P \
+          --clump-snp-field CPTID \
+          --clump {input.sumstats} \
+          --clump-p1 1.3e-8 --clump-p2 5e-6 --clump-r2 0.1 --clump-kb 1000 \
+          --clump-verbose \
+          --threads {threads} \
+          --silent \
+          --out {params.output}
+        
+        if [ ! -f {output} ] ; then
+          echo 'CHR F SNP BP P TOTAL NSIG S05 S01 S001 S0001' > {output}
+        fi
+    '''
+
+
+rule clean_clump:
+    input:
+        rules.clump.output[0]
+    output:
+        '{output}/{ethnicity}/{phenotype}/clumps/chr{chrom}.clumped.cleaned'
+    shell: """
+        awk -F '[[:space:]]+' '{{if (NR==2 || ($11!="" && $11!="S001")){{print}}}}' {input} | tr -s ' ' | sed 's/^ //;s/ $//' > {output} 
+    """
+
+
+rule concat_cleaned_clumps:
+    input:
+        expand(rules.clean_clump.output[0], chrom = range(1, 23), allow_missing=True)
+    output:
+        '{output}/{ethnicity}/{phenotype}/clumps/all-clumps.tsv'
+    shell: '''
+        head -n 1 {input[0]} > {output}
+        for f in {input} ; do
+            tail -n+2 $f
+        done >> {output}
+    '''
+
+
+checkpoint compile_regions:
+    input:
+        rules.concat_cleaned_clumps.output[0]
+    output:
+        '{output}/{ethnicity}/{phenotype}/regions.csv'
+    run:
+        sigs = pd.read_csv(input[0], sep = ' ')\
+                 .sort_values(['CHR', 'BP'])\
+                 .reset_index(drop=True)
+
+        sigs['overlap'] = ((sigs['CHR'].rolling(window=2, min_periods=1).max()==sigs['CHR'].rolling(window=2, min_periods=1).min())) \
+                        & ((sigs['BP'].rolling(window=2, min_periods=1).max()-sigs['BP'].rolling(window=2, min_periods=1).min())<=1000000)
+
+        group = 1
+        out = list()
+        for overlap in sigs['overlap']:
+            if overlap is True:
+                out.append(group)
+            else:
+                group+=1
+                out.append(group)
+        sigs['groups'] = out
+
+        regions = list()
+        for group in set(sigs['groups']):
+            subset = sigs[sigs['groups']==group]
+            chrom = subset['CHR'].iloc[0]
+            start, end = subset['BP'].min() - 1000000, subset['BP'].max() + 1000000
+            start = 0 if start < 0 else start
+            indeps = ','.join(subset['SNP'])
+            regions.append([group, chrom, start, end, indeps])
+
+        regions = pd.DataFrame(regions, columns = ['group', 'chrom', 'start', 'end', 'indeps'])
+        regions.insert(0, 'phenotype', wildcards['phenotype'])
+        regions.to_csv(output[0], index=False)
+
+
+rule make_cojofile:
+    input:
+        metal=metal
+    output:
+        '{output}/{ethnicity}/{phenotype}/cojofile.ma'
+    shell: '''
+        workflow/scripts/make_cojofile.sh {input.metal} {output}
+    '''
+
+
+rule create_extract:
+    input:
+        lambda w: checkpoints.compile_regions.get(output=w.output, ethnicity=w.ethnicity, phenotype=w.phenotype).output[0]
+    output:
+        '{output}/{ethnicity}/{phenotype}/stepwise/{chrom}.{start}.{end}/extract.txt'
+    run:
+        regions = pd.read_csv(input[0])
+        indeps = regions.loc[
+            (regions['chrom']==int(wildcards.chrom))
+            & (regions['start']==int(wildcards.start))
+            & (regions['end']==int(wildcards.end)),
+            'indeps'].iloc[0]
+        indep_vars = indeps.split(',')
+        with open(output[0], 'w') as f:
+            for var in indep_vars:
+                f.write(var)
+                f.write('\n')
+
+
+rule subset_bfile_for_stepwise:
+    '''
+    YC tested whether the output of stepwise is different when using the entire bfile vs using a subset bfile which only contains the
+    variants in "extract.txt". The runtime is a lot shorter, but the output is exactly the same.
+    '''
+    input:
+        bfile=lambda w: bfile(w.ethnicity, w.chrom),
+        extract=rules.create_extract.output[0]
+    params:
+        bfile=lambda w: bfile_params(w.ethnicity, w.chrom),
+        output='{output}/{ethnicity}/{phenotype}/stepwise/{chrom}.{start}.{end}/stepwise'
+    output:
+        multiext('{output}/{ethnicity}/{phenotype}/stepwise/{chrom}.{start}.{end}/stepwise', '.bed', '.bim', '.fam')
+    shell: '''
+        plink \
+            --bfile {params.bfile} \
+            --extract {input.extract} \
+            --make-bed \
+            --out {params.output} \
+            --threads {threads} \
+            --silent
+    '''
+
+rule stepwise:
+    input:
+        bfile=rules.subset_bfile_for_stepwise.output, # lambda w: bfile(w.ethnicity, w.chrom),
+        cojofile=rules.make_cojofile.output[0],
+        extract=rules.create_extract.output[0]
+    params:
+        bfile=rules.subset_bfile_for_stepwise.params.output, # lambda w: bfile_params(w.ethnicity, w.chrom),
+        output='{output}/{ethnicity}/{phenotype}/stepwise/{chrom}.{start}.{end}/stepwise'
+    output:
+       cma='{output}/{ethnicity}/{phenotype}/stepwise/{chrom}.{start}.{end}/stepwise.cma.cojo',
+       jma='{output}/{ethnicity}/{phenotype}/stepwise/{chrom}.{start}.{end}/stepwise.jma.cojo',
+       badsnps='{output}/{ethnicity}/{phenotype}/stepwise/{chrom}.{start}.{end}/stepwise.freq.badsnps'
+    log:
+        '{output}/{ethnicity}/{phenotype}/stepwise/{chrom}.{start}.{end}/stepwise.log'
+    threads:
+        workflow.cores // 10
+    shell: '''
+        gcta64 \
+            --bfile {params.bfile} \
+            --cojo-file {input.cojofile} \
+            --cojo-slct \
+            --cojo-p 1.3e-8 \
+            --threads {threads} \
+            --out {params.output} \
+            --extract {input.extract} 2>&1 > {log} || true
+        
+        if [ ! -f "{output.badsnps}" ] ; then
+            echo 'SNP A1 A2 RefA geno_freq freq' | tr ' ' '\t' > {output.badsnps}
+        fi
+
+        flag=$(grep -m1 "Error: all the SNPs in the GWAS meta-analysis results can't be found" {log}) || true
+        if [ -n "$flag" ] ; then
+            # This is for when COJO fails because both variants in the input.extract file
+            # have very different freq between cojofile and input bfile.
+            echo 'Chr SNP bp refA freq b se p n freq_geno bJ bJ_se pJ LD_r' | tr ' ' '\t' > {output.jma}
+            echo 'Chr SNP bp refA freq b se p n freq_geno bC bC_se pC' | tr ' ' '\t' > {output.cma}
+        fi
+    '''
+
+
+def input_collect_all_badsnps(w):
+    regions_f = checkpoints.compile_regions.get(output=w.output, ethnicity=w.ethnicity, phenotype=w.phenotype).output[0]
+    regions = pd.read_csv(regions_f)
+    
+    inputs = list()
+    for _, (pheno, group, chrom, start, end, indeps) in regions.iterrows():
+        if len(indeps.split(','))>1:
+            freq_badsnp = f'{w.output}/{w.ethnicity}/{pheno}/stepwise/{chrom}.{start}.{end}/stepwise.freq.badsnps'
+            if freq_badsnp=='output/ALL/HIP/stepwise/10.64076932.66323265/stepwise.freq.badsnps':
+                continue
+            inputs.append(freq_badsnp)
+
+            
+    return inputs
+
+rule collect_all_badsnps:
+    input:
+        badsnps=input_collect_all_badsnps,
+        metal=metal
+    output:
+        '{output}/{ethnicity}/{phenotype}/stepwise/all.badsnps.csv'
+    run:
+        out_badsnps= list()
+        for f in input:
+            if Path(f).is_file() and Path(f).stat().st_size > 0:
+                out_badsnps.append(f)
+        if not out_badsnps:
+            pd.DataFrame(columns = ['phenotype', 'ID', 'chrom', 'pos', 'b', 'se', 'p', 'bC', 'bC_se', 'pC', 'type'])\
+              .to_csv(output[0], index=False)
+            return
+        badsnps = pd.concat([pd.read_csv(f, sep = '\t') for f in out_badsnps])
+        badsnps = badsnps[['SNP']].rename(columns = {'SNP': 'ID'})
+        metal = pd.read_csv(input.metal, sep = '\t')[['CPTID', 'CHR', 'POS', 'BETA', 'SE', 'P']]
+        metal.columns = ['ID', 'chrom', 'pos', 'b', 'se', 'p']
+
+        badsnps2 = badsnps.merge(metal, on = 'ID')
+        for col in ['bC', 'bC_se', 'pC']:
+            badsnps2[col] = np.nan
+        
+        badsnps2.insert(0, 'phenotype', wildcards.phenotype)
+        badsnps2['type'] = 'cojo_fail'
+        badsnps2.to_csv(output[0], index=False)
+
+
+def input_run_all_stepwise(w):
+    regions_f = checkpoints.compile_regions.get(output=w.output, ethnicity=w.ethnicity, phenotype=w.phenotype).output[0]
+    regions = pd.read_csv(regions_f)
+    
+    inputs = list()
+    for _, (pheno, group, chrom, start, end, indeps) in regions.iterrows():
+        if len(indeps.split(','))>1:
+            signal = f'{w.output}/{w.ethnicity}/{pheno}/stepwise/{chrom}.{start}.{end}/stepwise.jma.cojo'
+            if signal=='output/ALL/HIP/stepwise/10.64076932.66323265/stepwise.jma.cojo':
+                continue
+            inputs.append(signal)
+
+    return inputs
+
+rule run_all_stepwise:
+    input:
+        input_run_all_stepwise,
+    output:
+       '{output}/{ethnicity}/{phenotype}/stepwise/all.jma.csv'
+    run:
+        out_jma= list()
+        for f in input:
+            if Path(f).is_file() and Path(f).stat().st_size > 0:
+                out_jma.append(f)
+        if not out_jma:
+            pd.DataFrame(columns = ['phenotype', 'ID', 'chrom', 'pos', 'b', 'se', 'p', 'bC', 'bC_se', 'pC', 'type'])\
+              .to_csv(output[0], index=False)
+            return
+        stepwise = pd.concat([pd.read_csv(f, sep = '\t') for f in out_jma])
+        stepwise = stepwise[['SNP', 'Chr', 'bp', 'b', 'se', 'p', 'bJ', 'bJ_se', 'pJ']]
+        stepwise.columns = ['ID', 'chrom', 'pos', 'b', 'se', 'p', 'bC', 'bC_se', 'pC']
+        stepwise.insert(0, 'phenotype', wildcards.phenotype)
+        stepwise['type'] = 'cond_pass'
+        stepwise.to_csv(output[0], index=False)
+
+rule collect_all_singles:
+    input:
+        sumstats=metal,
+        regions_f=lambda w: checkpoints.compile_regions.get(output=w.output, ethnicity=w.ethnicity, phenotype=w.phenotype).output[0]
+    output:
+        '{output}/{ethnicity}/{phenotype}/all.singles.csv'
+    run:
+        sumstats = pd.read_csv(input.sumstats, sep = '\t')
+        regions = pd.read_csv(input.regions_f)
+        
+        inputs = [indeps for _, (_, _, _, _, _, indeps) in regions.iterrows() if len(indeps.split(','))==1]
+        
+        sumstats = sumstats.loc[sumstats['CPTID'].isin(inputs),
+                                  ['CPTID', 'CHR', 'POS', 'BETA', 'SE', 'P']]
+        sumstats.columns = ['ID', 'chrom', 'pos', 'b', 'se', 'p']
+        sumstats.insert(0, 'phenotype', wildcards.phenotype)
+        sumstats['bC'] = np.nan
+        sumstats['bC_se'] = np.nan
+        sumstats['pC'] = np.nan
+        sumstats['type'] = 'single'
+        sumstats.to_csv(output[0], index=False)
+
+
+rule combine:
+    input:
+        conds=rules.run_all_stepwise.output[0],
+        singles=rules.collect_all_singles.output[0],
+        badsnps=rules.collect_all_badsnps.output[0],
+    output:
+        '{output}/{ethnicity}/{phenotype}/combined.csv'
+    run:
+        combined = pd.concat([pd.read_csv(f) for f in input])
+        combined.sort_values(['chrom', 'pos'], inplace=True)
+        combined.to_csv(output[0], index=False)
+
+
+# Collect .cma output files
+def input_all_stepwise_out_cma(w):
+    regions_f = checkpoints.compile_regions.get(output=w.output, ethnicity=w.ethnicity, phenotype=w.phenotype).output[0]
+    regions = pd.read_csv(regions_f)
+    
+    inputs = list()
+    for _, (pheno, group, chrom, start, end, indeps) in regions.iterrows():
+        if len(indeps.split(','))>1:
+            signal = f'{output}/{pheno}/stepwise/{chrom}.{start}.{end}/stepwise.cma.cojo'
+            inputs.append(signal)
+    return inputs
+
+
+rule run_all_stepwise_cma:
+    input:
+        input_all_stepwise_out_cma,
+    output:
+       '{output}/{ethnicity}/{phenotype}/stepwise/all.cma.csv'
+    run:
+        out_cma= list()
+        for f in input:
+            if Path(f).is_file() and Path(f).stat().st_size > 0: 
+                out_cma.append(f)
+        stepwise_cma = pd.concat([ pd.read_csv(f, sep = '\t') for f in out_cma])
+        stepwise_cma = stepwise_cma[['SNP', 'Chr', 'bp', 'b', 'se', 'p', 'bC', 'bC_se', 'pC']]
+        stepwise_cma.columns = ['ID', 'chrom', 'pos', 'b', 'se', 'p', 'bC', 'bC_se', 'pC']
+        stepwise_cma.insert(0, 'phenotype', wildcards.phenotype)
+        stepwise_cma['type'] = 'cond_fail'
+        stepwise_cma.to_csv(output[0], index=False)
+
+
+rule combine_all:
+    input: 
+        conds_pass = rules.run_all_stepwise.output[0],
+        conds_fail = rules.run_all_stepwise_cma.output[0],
+        singles=rules.collect_all_singles.output[0],
+        badsnps=rules.collect_all_badsnps.output[0],
+        regions_f = lambda w: checkpoints.compile_regions.get(output=w.output, ethnicity=w.ethnicity, phenotype=w.phenotype).output[0]
+    output:
+        '{output}/{ethnicity}/{phenotype}/combined.all.csv'
+    run:
+        conds_pass= pd.read_csv(input.conds_pass)
+        conds_fail= pd.read_csv(input.conds_fail)
+        combine_jma_cma= pd.concat([conds_pass, conds_fail])
+        combine_jma_cma['ID']= combine_jma_cma['ID'].astype(str)
+        regions = pd.read_csv(input.regions_f)
+        regions['indeps']= regions.indeps.str.split('[,]')
+        regions = regions.explode('indeps').reset_index(drop=True)
+        combine_jma_cma=combine_jma_cma.merge(regions[['group','indeps']], left_on='ID', right_on='indeps')
+        combine_jma_cma=combine_jma_cma[['phenotype', 'group', 'ID', 'chrom','pos','b', 'se', 'p', 'type']]
+        singles=pd.read_csv(input.singles)
+        singles=singles.merge(regions[['group','indeps']], left_on='ID', right_on='indeps')
+        singles=singles[['phenotype', 'group', 'ID', 'chrom','pos', 'b', 'se', 'p', 'type']]
+
+        badsnps=pd.read_csv(input.badsnps)
+        badsnps=badsnps.merge(regions[['group','indeps']], left_on='ID', right_on='indeps')
+        badsnps=badsnps[['phenotype', 'group', 'ID', 'chrom','pos', 'b', 'se', 'p', 'type']]
+
+        combined= pd.concat([combine_jma_cma, singles, badsnps])
+        combined.sort_values(['chrom', 'group'], inplace=True)
+        combined.to_csv(output[0], index=False)
+        
+
+
+def input_compile_across_phenotypes(w):
+    phenotypes = INPUT_PHENOTYPES_DF[0].to_list()
+    return expand('{output}/{ethnicity}/{phenotype}/combined.csv', output=w.output, ethnicity=w.ethnicity, phenotype=phenotypes)
+
+checkpoint compile_across_phenotypes:
+    input:
+        input_compile_across_phenotypes
+    output:
+        input_phenotypes='{output}/{ethnicity}/across-pheno/{output_name}/input_phenotypes.txt',
+        comb='{output}/{ethnicity}/across-pheno/{output_name}/comb.csv',
+        to_run='{output}/{ethnicity}/across-pheno/{output_name}/to_run.csv',
+        same_var='{output}/{ethnicity}/across-pheno/{output_name}/same_var.csv'
+    run:
+        INPUT_PHENOTYPES_DF.to_csv(output.input_phenotypes, index=False, header=False)
+        comb = pd.concat([pd.read_csv(f) for f in input])
+        comb = comb.sort_values(['chrom', 'pos', 'p']).reset_index(drop=True)
+        comb.insert(0, 'pheno_ID', comb['phenotype'] + '_' + comb['ID'])
+
+        comb['overlap'] = ((comb['chrom'].rolling(window=2, min_periods=1).max()==comb['chrom'].rolling(window=2, min_periods=1).min())) \
+                        & ((comb['pos'].rolling(window=2, min_periods=1).max()-comb['pos'].rolling(window=2, min_periods=1).min())<=1_000_000)
+
+        group = 1
+        out = list()
+        for overlap in comb['overlap']:
+            if overlap is True:
+                out.append(group)
+            else:
+                group+=1
+                out.append(group)
+        comb['groups'] = out
+
+        group_size = list()
+        for group in set(comb['groups']):
+            left = comb.loc[comb['groups']==group, 'pos'].min() - 1_000_000
+            left = 0 if left<0 else left
+            right = comb.loc[comb['groups']==group, 'pos'].min() + 1_000_000
+            chrom = set(comb.loc[comb['groups']==group, 'chrom'])
+            assert len(chrom)==1
+            chrom = chrom.pop()
+            group_size.append([group, chrom, left, right])
+        group_size = pd.DataFrame(group_size, columns = ['groups', 'group_chrom', 'group_start', 'group_end'])
+
+        to_run = list()
+        for group in set(comb['groups']):
+            variants = comb.loc[comb['groups']==group, 'pheno_ID']
+            prod = [(v1, v2) for v1, v2 in itertools.product(variants, variants) if v1!=v2]
+            chrom = set(comb.loc[comb['groups']==group, 'chrom'])
+            assert len(chrom)==1, 'variants on different chromosomes grouped together'
+            chrom = chrom.pop()
+            for (this, other) in prod:
+                tmp = comb.loc[comb['pheno_ID']==this, ['phenotype', 'ID']]
+                assert tmp.shape[0]==1, 'Multiple thisID'
+                this_pheno, this_id = tmp.iloc[0]
+                tmp = comb.loc[comb['pheno_ID']==other, ['phenotype', 'ID']]
+                assert tmp.shape[0]==1, 'Multiple otherID'
+                other_pheno, other_id = tmp.iloc[0]
+                comb_id = this + '_' + other
+                
+                row = [group, comb_id, this, this_pheno, this_id, other, other_pheno, other_id]
+                to_run.append(row)
+        to_run = pd.DataFrame(to_run,
+                            columns = ['groups', 'pairID', 'leftID', 'leftPheno', 'leftVar', 'rightID', 'rightPheno', 'rightVar'])
+        to_run = pd.merge(group_size, to_run, on = 'groups')
+        
+        comb.to_csv(output.comb, index=False)
+        to_run[to_run['leftVar']!=to_run['rightVar']].to_csv(output.to_run, index=False)
+        to_run[to_run['leftVar']==to_run['rightVar']].to_csv(output.same_var, index=False)
